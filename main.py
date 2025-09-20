@@ -23,11 +23,11 @@ app = FastAPI(title="STBG Project Prioritization API", version="1.0.0")
 # Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Accept"],
-    expose_headers=["Content-Type"]
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 class AnalysisResults(BaseModel):
@@ -568,6 +568,17 @@ def read_root():
     return {"message": "Welcome to the STBG Project Prioritization API"}
 
 
+@app.options("/analyze")
+async def analyze_options():
+    response = JSONResponse(content={"message": "OK"})
+    response.headers.update({
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "3600",
+    })
+    return response
+
 @app.post("/analyze", response_model=AnalysisResults)
 async def analyze_projects(
     projects_file: UploadFile = File(...),
@@ -575,8 +586,13 @@ async def analyze_projects(
     aadt_file: UploadFile = File(...),
     pop_emp_file: UploadFile = File(...),
     ej_areas_file: UploadFile = File(...),
-    non_work_dest_file: UploadFile = File(...)
+    non_work_dest_file: UploadFile = File(...),
 ):
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
     with tempfile.TemporaryDirectory() as temp_dir:
         files_dict = {}
         try:
@@ -627,7 +643,9 @@ async def analyze_projects(
             if "error" in results.get("summary", {}):
                 raise HTTPException(status_code=500, detail=results["summary"]["error"])
                 
-            return results
+            response = JSONResponse(content=results)
+            response.headers.update(headers)
+            return response
 
         except HTTPException as he:
             raise he
