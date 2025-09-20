@@ -543,3 +543,88 @@ class STBGAnalyzer:
                 results.append(project_result)
             
             # Sort by rank
+            results_sorted = sorted(results, key=lambda x: x['rank'])
+
+            summary = {
+                "total_projects": len(results_sorted),
+                "total_cost": sum(p['cost_mil'] for p in results_sorted)
+            }
+
+            return {"projects": results_sorted, "summary": summary}
+
+        except Exception as e:
+            print(f"Error in final score calculation: {e}")
+            return {
+                "projects": [],
+                "summary": {"error": str(e)}
+            }
+
+@app.post("/analyze", response_model=AnalysisResults)
+async def analyze_projects(
+    projects_file: UploadFile = File(...),
+    crashes_file: UploadFile = File(...),
+    aadt_file: UploadFile = File(...),
+    pop_emp_file: UploadFile = File(...),
+    ej_areas_file: UploadFile = File(...),
+    non_work_dest_file: UploadFile = File(...)
+):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        files_dict = {}
+        try:
+            # Create a mapping of official keys to expected file name parts
+            file_key_map = {
+                "projects": "project",
+                "crashes": "crash",
+                "aadt": "aadt",
+                "pop_emp": ["pop", "emp"],
+                "ej_areas": "ej",
+                "non_work_dest": "non_work"
+            }
+
+            # Create a reverse map for easy lookup
+            reverse_file_key_map = {}
+            for key, parts in file_key_map.items():
+                if isinstance(parts, list):
+                    for part in parts:
+                        reverse_file_key_map[part] = key
+                else:
+                    reverse_file_key_map[parts] = key
+
+            all_files = [
+                projects_file, crashes_file, aadt_file, 
+                pop_emp_file, ej_areas_file, non_work_dest_file
+            ]
+
+            for upload_file in all_files:
+                file_path = os.path.join(temp_dir, upload_file.filename)
+                with open(file_path, "wb") as f:
+                    f.write(await upload_file.read())
+                
+                # Find the corresponding key
+                file_key = None
+                for part, key in reverse_file_key_map.items():
+                    if part in upload_file.filename.lower():
+                        file_key = key
+                        break
+                
+                if file_key:
+                    files_dict[file_key] = file_path
+
+            analyzer = STBGAnalyzer()
+            analyzer.load_geospatial_data(files_dict)
+            
+            results = analyzer.calculate_final_scores()
+            
+            if "error" in results.get("summary", {}):
+                raise HTTPException(status_code=500, detail=results["summary"]["error"])
+                
+            return results
+
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
