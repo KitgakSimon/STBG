@@ -1,8 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
+gunicorn
 geopandas
 shapely
-fiona
-pyproj
 pandas
 numpy
