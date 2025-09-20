@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 # Get allowed origins from environment variable
 allowed_origins = [
     "http://localhost:5173",
-    "https://charming-fudge-b536d3.netlify.app",
+    "http://127.0.0.1:5173",
     "https://stbg-projects.netlify.app"
 ]
 
@@ -582,7 +582,7 @@ def read_root():
 async def analyze_options():
     response = JSONResponse(content={"message": "OK"})
     response.headers.update({
-        "Access-Control-Allow-Origin": "https://charming-fudge-b536d3.netlify.app",
+        "Access-Control-Allow-Origin": "https://stbg-projects.netlify.app",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Origin, X-Requested-With",
         "Access-Control-Max-Age": "3600",
@@ -599,7 +599,7 @@ async def analyze_projects(
     non_work_dest_file: UploadFile = File(...),
 ):
     headers = {
-        "Access-Control-Allow-Origin": "https://charming-fudge-b536d3.netlify.app",
+        "Access-Control-Allow-Origin": "https://stbg-projects.netlify.app",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Origin, X-Requested-With",
         "Access-Control-Max-Age": "3600",
