@@ -16,18 +16,28 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Get allowed origins from environment variable
-allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://charming-fudge-b536d3.netlify.app"
+]
 
 app = FastAPI(title="STBG Project Prioritization API", version="1.0.0")
 
 # Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"]
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "Accept",
+        "Origin",
+        "X-Requested-With"
+    ],
+    expose_headers=["Content-Type"]
 )
 
 class AnalysisResults(BaseModel):
@@ -572,9 +582,9 @@ def read_root():
 async def analyze_options():
     response = JSONResponse(content={"message": "OK"})
     response.headers.update({
-        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Origin": "https://charming-fudge-b536d3.netlify.app",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Origin, X-Requested-With",
         "Access-Control-Max-Age": "3600",
     })
     return response
@@ -589,9 +599,10 @@ async def analyze_projects(
     non_work_dest_file: UploadFile = File(...),
 ):
     headers = {
-        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Origin": "https://charming-fudge-b536d3.netlify.app",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Origin, X-Requested-With",
+        "Access-Control-Max-Age": "3600",
     }
     with tempfile.TemporaryDirectory() as temp_dir:
         files_dict = {}
