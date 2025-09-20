@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 allowed_origins = [
     "http://localhost:5173",
     "https://charming-fudge-b536d3.netlify.app",
-    "https://stbg-projects.netlify.app/"
+    "https://stbg-projects.netlify.app"
 ]
 
 app = FastAPI(title="STBG Project Prioritization API", version="1.0.0")
