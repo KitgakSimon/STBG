@@ -559,6 +559,11 @@ class STBGAnalyzer:
                 "summary": {"error": str(e)}
             }
 
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the STBG Project Prioritization API"}
+
+
 @app.post("/analyze", response_model=AnalysisResults)
 async def analyze_projects(
     projects_file: UploadFile = File(...),
