@@ -5,7 +5,6 @@ from typing import List, Dict, Any
 import pandas as pd
 import geopandas as gpd
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import asyncio
@@ -15,30 +14,7 @@ from shapely.geometry import Point
 import warnings
 warnings.filterwarnings('ignore')
 
-# Get allowed origins from environment variable
-allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://stbg-projects.netlify.app"
-]
-
 app = FastAPI(title="STBG Project Prioritization API", version="1.0.0")
-
-# Enable CORS for frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=[
-        "Content-Type",
-        "Authorization",
-        "Accept",
-        "Origin",
-        "X-Requested-With"
-    ],
-    expose_headers=["Content-Type"]
-)
 
 class AnalysisResults(BaseModel):
     projects: List[Dict[str, Any]]
@@ -69,6 +45,7 @@ class STBGAnalyzer:
                 
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error loading geospatial data: {str(e)}")
+
     
     def calculate_safety_frequency(self) -> pd.DataFrame:
         """Calculate safety frequency score based on crash data"""
