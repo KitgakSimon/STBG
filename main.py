@@ -5,6 +5,7 @@ from typing import List, Dict, Any
 import pandas as pd
 import geopandas as gpd
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import asyncio
@@ -14,7 +15,30 @@ from shapely.geometry import Point
 import warnings
 warnings.filterwarnings('ignore')
 
+# Get allowed origins from environment variable
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://stbg-projects.netlify.app"
+]
+
 app = FastAPI(title="STBG Project Prioritization API", version="1.0.0")
+
+# Enable CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "Accept",
+        "Origin",
+        "X-Requested-With"
+    ],
+    expose_headers=["Content-Type"]
+)
 
 class AnalysisResults(BaseModel):
     projects: List[Dict[str, Any]]
@@ -45,7 +69,6 @@ class STBGAnalyzer:
                 
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error loading geospatial data: {str(e)}")
-
     
     def calculate_safety_frequency(self) -> pd.DataFrame:
         """Calculate safety frequency score based on crash data"""
@@ -557,14 +580,7 @@ def read_root():
 
 @app.options("/analyze")
 async def analyze_options():
-    response = JSONResponse(content={"message": "OK"})
-    response.headers.update({
-        "Access-Control-Allow-Origin": "https://stbg-projects.netlify.app",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Origin, X-Requested-With",
-        "Access-Control-Max-Age": "3600",
-    })
-    return response
+    return JSONResponse(content={"message": "OK"})
 
 @app.post("/analyze", response_model=AnalysisResults)
 async def analyze_projects(
@@ -575,12 +591,7 @@ async def analyze_projects(
     ej_areas_file: UploadFile = File(...),
     non_work_dest_file: UploadFile = File(...),
 ):
-    headers = {
-        "Access-Control-Allow-Origin": "https://stbg-projects.netlify.app",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Origin, X-Requested-With",
-        "Access-Control-Max-Age": "3600",
-    }
+    
     with tempfile.TemporaryDirectory() as temp_dir:
         files_dict = {}
         try:
@@ -632,7 +643,6 @@ async def analyze_projects(
                 raise HTTPException(status_code=500, detail=results["summary"]["error"])
                 
             response = JSONResponse(content=results)
-            response.headers.update(headers)
             return response
 
         except HTTPException as he:
