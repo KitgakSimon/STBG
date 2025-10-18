@@ -25,8 +25,9 @@ app = FastAPI(title="STBG Project Prioritization API", version="1.0.0")
 origins = [
     "http://localhost:5173",
     "http://localhost:5174",
-    "https://stbg-projects-highway.netlify.app/",
     "https://stbg-projects-highway.netlify.app",
+    "https://stbg.onrender.com", # The backend origin
+    "https://stbg-projects-highway.netlify.app/", # Trailing slash for flexibility
 ]
 
 app.add_middleware(
