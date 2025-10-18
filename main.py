@@ -1,735 +1,1100 @@
+# -*- coding: utf-8 -*-
+"""
+STBG Project Prioritization API
+
+This script provides a FastAPI endpoint to analyze highway projects based on various criteria.
+"""
+
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry import Point
+from functools import reduce
+import warnings
 import os
 import tempfile
-import json
 from typing import List, Dict, Any
-import pandas as pd
-import geopandas as gpd
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import asyncio
-from functools import reduce
-import numpy as np
-from shapely.geometry import Point
-import warnings
-warnings.filterwarnings('ignore')
+import uvicorn
 
-# Get allowed origins from environment variable
-allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://stbg-projects.netlify.app"
-    "http://stbg-projects-highway.netlify.app/"
-]
+warnings.filterwarnings('ignore')
 
 app = FastAPI(title="STBG Project Prioritization API", version="1.0.0")
 
-# Enable CORS for frontend
+origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://stbg-projects-highway.netlify.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=[
-        "Content-Type",
-        "Authorization",
-        "Accept",
-        "Origin",
-        "X-Requested-With"
-    ],
-    expose_headers=["Content-Type"]
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 class AnalysisResults(BaseModel):
     projects: List[Dict[str, Any]]
     summary: Dict[str, Any]
 
-class STBGAnalyzer:
-    def __init__(self):
-        self.projects_gdf = None
-        self.crashes_gdf = None
-        self.aadt_gdf = None
-        self.pop_emp_gdf = None
-        self.ej_gdf = None
-        self.nw_gdf = None
-        self.hopewell_frsk_gdf = None
-        self.hopewell_fhz_gdf = None
-        self.hopewell_wet_gdf = None
-        self.hopewell_con_gdf = None
-        self.actv_mpo_gdf = None
-        self.t6_gdf = None
+# =============================================================================
+# 1. SAFETY - CRASH FREQUENCY
+# =============================================================================
+
+def analyze_safety_frequency(projects_gdf, crashes_gdf):
+    """Analyze safety based on crash frequency within project buffers"""
+    
+    # Load data
+    gdf = projects_gdf.copy()
+    crashes = crashes_gdf.copy()
+    
+    # Ensure projected CRS for buffer
+    gdf = gdf.to_crs(epsg=2263)  # feet
+    crashes = crashes.to_crs(gdf.crs)
+    
+    # Add project_id if not present
+    if "project_id" not in gdf.columns:
+        gdf["project_id"] = range(1, len(gdf) + 1)
+    
+    # Create 250 ft buffer
+    gdf_buffered = gdf.copy()
+    gdf_buffered["geometry"] = gdf_buffered.geometry.buffer(250)
+    
+    # Select crashes that intersect buffer
+    crashes_in_buffer = gpd.sjoin(
+        crashes,
+        gdf_buffered[["project_id", "geometry"]],
+        how="inner",
+        predicate="intersects"
+    )
+    
+    # Summarize crash people counts per buffer
+    crash_sums = crashes_in_buffer.groupby("project_id").agg({
+        "K_PEOPLE": "sum",
+        "A_PEOPLE": "sum",
+        "B_PEOPLE": "sum",
+        "C_PEOPLE": "sum"
+    }).reset_index()
+    
+    # Merge summary back to buffers
+    gdf_buffered = gdf_buffered.merge(crash_sums, on="project_id", how="left")
+    gdf_buffered.fillna(0, inplace=True)
+    
+    # Reproject back to WGS84 for saving/visualization
+    gdf_buffered = gdf_buffered.to_crs(epsg=4326)
+    
+    # Calculate EPDO
+    gdf_buffered["EPDO"] = (
+        gdf_buffered["K_PEOPLE"] * 2715000 +
+        gdf_buffered["A_PEOPLE"] * 2715000 +
+        gdf_buffered["B_PEOPLE"] * 300000 +
+        gdf_buffered["C_PEOPLE"] * 170000
+    )
+    
+    # Calculate benefit = EPDO * (1 - cmf)
+    gdf_buffered["benefit"] = gdf_buffered["EPDO"] * (1 - gdf_buffered["cmf"])
+    
+    # Calculate safety score
+    max_benefit = gdf_buffered["benefit"].max()
+    
+    # Avoid divide by zero
+    if max_benefit > 0:
+        gdf_buffered["safety_freq"] = (gdf_buffered["benefit"] / max_benefit) * 50
+    else:
+        gdf_buffered["safety_freq"] = 0
+    
+    safety_freq = gdf_buffered[['project_id', 'safety_freq']]
+    return safety_freq
+
+# =============================================================================
+# 2. SAFETY - CRASH RATE
+# =============================================================================
+
+def analyze_safety_rate(projects_gdf, crashes_gdf):
+    """Analyze safety based on crash rate (normalized by traffic volume)"""
+    
+    # Load and process data
+    gdf = projects_gdf.copy()
+    crashes = crashes_gdf.copy()
+    
+    # Process data similar to safety frequency analysis
+    gdf_buffered = gdf.to_crs(epsg=2263)
+    crashes = crashes.to_crs(gdf.crs)
+    
+    if "project_id" not in gdf.columns:
+        gdf["project_id"] = range(1, len(gdf) + 1)
+    
+    gdf_buffered = gdf.copy()
+    gdf_buffered["geometry"] = gdf_buffered.geometry.buffer(250)
+    
+    crashes_in_buffer = gpd.sjoin(
+        crashes,
+        gdf_buffered[["project_id", "geometry"]],
+        how="inner",
+        predicate="intersects"
+    )
+    
+    crash_sums = crashes_in_buffer.groupby("project_id").agg({
+        "K_PEOPLE": "sum",
+        "A_PEOPLE": "sum",
+        "B_PEOPLE": "sum",
+        "C_PEOPLE": "sum"
+    }).reset_index()
+    
+    gdf_buffered = gdf_buffered.merge(crash_sums, on="project_id", how="left")
+    gdf_buffered.fillna(0, inplace=True)
+    gdf_buffered = gdf_buffered.to_crs(epsg=4326)
+    
+    gdf_buffered["EPDO"] = (
+        gdf_buffered["K_PEOPLE"] * 2715000 +
+        gdf_buffered["A_PEOPLE"] * 2715000 +
+        gdf_buffered["B_PEOPLE"] * 300000 +
+        gdf_buffered["C_PEOPLE"] * 170000
+    )
+    
+    gdf_buffered["benefit"] = gdf_buffered["EPDO"] * (1 - gdf_buffered["cmf"])
+    
+    # Define epdo_rate based on project type
+    def calculate_epdo_rate_and_vmt(row):
+        if row["type"].lower() == "highway":
+            vmt = row["AADT"] * row["length"] * 365 / 100_000_000
+        elif row["type"].lower() == "intersection":
+            vmt = row["AADT"] * 365 / 1_000_000
+        else:
+            vmt = 1  # avoid division by zero
+        epdo_rate = row["benefit"] / vmt if vmt != 0 else 0
+        return pd.Series({"VMT": vmt, "epdo_rate": epdo_rate})
+    
+    # Apply function
+    gdf_buffered[["VMT", "epdo_rate"]] = gdf_buffered.apply(calculate_epdo_rate_and_vmt, axis=1)
+    
+    # Calculate safety_rate
+    max_rate = gdf_buffered["epdo_rate"].max()
+    
+    # Avoid division by zero
+    if max_rate > 0:
+        gdf_buffered["safety_rate"] = (gdf_buffered["epdo_rate"] / max_rate) * 50
+    else:
+        gdf_buffered["safety_rate"] = 0
+    
+    safety_rate = gdf_buffered[['project_id', 'safety_rate']]
+    return safety_rate
+
+# =============================================================================
+# 3. CONGESTION - DEMAND
+# =============================================================================
+
+def analyze_congestion_demand(projects_gdf, aadt_gdf):
+    """Analyze congestion based on traffic demand"""
+    
+    # Load projects
+    projects = projects_gdf.copy()
+    
+    # Load AADT segments
+    aadt = aadt_gdf.copy()
+    
+    # Ensure both are in the same CRS
+    projects = projects.to_crs(epsg=2283)  # Virginia State Plane
+    aadt = aadt.to_crs(projects.crs)
+    
+    buffer_distance = 0.25 * 1609.34  # meters
+    projects["buffer"] = projects.geometry.buffer(buffer_distance)
+    
+    # Convert project buffers to GeoDataFrame
+    project_buffers = projects.set_geometry("buffer")
+    
+    # Perform spatial join
+    intersected = gpd.sjoin(aadt, project_buffers, how="inner", predicate="intersects")
+    
+    intersected["segment_mileage"] = intersected.geometry.length / 1609.34  # meters → miles
+    intersected["vmt"] = intersected["aadt_0"] * intersected["segment_mileage"]
+    
+    wa_aadt = (
+        intersected.groupby("project_id")
+        .apply(lambda x: x["vmt"].sum() / x["segment_mileage"].sum())
+        .reset_index(name="wa_aadt")
+    )
+    
+    # Drop any existing wa_aadt columns to avoid _x/_y
+    projects = projects.drop(columns=[col for col in projects.columns if "wa_aadt" in col], errors="ignore")
+    
+    # Merge the computed wa_aadt
+    projects = projects.merge(wa_aadt, on="project_id", how="left")
+    
+    # Replace NaN with 0
+    projects["wa_aadt"] = projects["wa_aadt"].fillna(0)
+    
+    # Normalize
+    projects["cong_demand"] = (projects["wa_aadt"] / projects["wa_aadt"].max()) * 10
+    projects = projects[['project_id', 'cong_demand']]
+    
+    return projects
+
+# =============================================================================
+# 4. CONGESTION - LEVEL OF SERVICE
+# =============================================================================
+
+def analyze_congestion_los(projects_gdf, aadt_gdf):
+    """Analyze congestion based on Level of Service"""
+    
+    # Load project and AADT layers
+    projects = projects_gdf.copy()
+    aadt = aadt_gdf.copy()
+    
+    # Create cong_value column based on los_0
+    los_mapping = {
+        "A": 0,
+        "B": 1,
+        "C": 2,
+        "D": 3,
+        "E": 3,
+        "F": 3
+    }
+    
+    aadt["cong_value"] = aadt["los_0"].map(los_mapping)
+    
+    # Create 0.25 mile buffer around project locations
+    projects = projects.to_crs(epsg=3857)  # project to metric CRS
+    aadt = aadt.to_crs(epsg=3857)
+    
+    projects["buffer"] = projects.geometry.buffer(402.336)
+    
+    # Intersect buffer and AADT segments
+    projects_exploded = projects.explode(index_parts=False)
+    intersected = gpd.overlay(aadt, gpd.GeoDataFrame(geometry=projects_exploded["buffer"]), how="intersection")
+    
+    # Sum cong_value for all segments in each project buffer
+    intersected = intersected.merge(projects[["project_id", "buffer"]], left_on='geometry', right_on='buffer', how='left')
+    
+    project_cong = (
+        intersected.groupby("project_id")["cong_value"]
+        .sum()
+        .reset_index(name="sum_cong_value")
+    )
+    
+    # Merge back to projects
+    projects = projects.merge(project_cong, on="project_id", how="left")
+    projects["sum_cong_value"] = projects["sum_cong_value"].fillna(0)
+    
+    # Normalize
+    normalized = (projects["sum_cong_value"] / projects["sum_cong_value"].max()) * 5
+    # If indivisible (not integer), return 0
+    projects["cong_los"] = normalized.where(normalized % 1 == 0, 0)
+    
+    projects = projects[['project_id', 'cong_los']]
+    
+    return projects
+
+# =============================================================================
+# 5. EQUITY/ACCESS - ACCESS TO JOBS
+# =============================================================================
+
+def analyze_equity_access_jobs(projects_gdf, popemp_gdf):
+    """Analyze equity and access to jobs"""
+    
+    # Load datasets
+    pop_emp_df = popemp_gdf.copy()
+    projects = projects_gdf.copy()
+    
+    # Define buffer distances in meters
+    fc_distances_miles = {"PA": 10, "MA": 7.5, "MC": 5}
+    mile_to_meter = 1609.34
+    fc_distances_m = {k: v * mile_to_meter for k, v in fc_distances_miles.items()}
+    
+    # Project both datasets to a projected CRS
+    projects = projects.to_crs(epsg=2283)
+    pop_emp_df = pop_emp_df.to_crs(epsg=2283)
+    
+    # Calculate TAZ centroids
+    pop_emp_df["centroid"] = pop_emp_df.geometry.centroid
+    
+    results = []
+    
+    # For each project
+    for _, proj in projects.iterrows():
+        fc = proj["fc"]
+        buffer_dist = fc_distances_m[fc]
         
-    def load_geospatial_data(self, files_dict: Dict[str, str]):
-        """Load all geospatial data files"""
-        try:
-            self.projects_gdf = gpd.read_file(files_dict['projects'])
-            self.crashes_gdf = gpd.read_file(files_dict['crashes'])
-            self.aadt_gdf = gpd.read_file(files_dict['aadt'])
-            self.pop_emp_gdf = gpd.read_file(files_dict['pop_emp'])
-            self.ej_gdf = gpd.read_file(files_dict['ej_areas'])
-            self.nw_gdf = gpd.read_file(files_dict['non_work_dest'])
-            self.hopewell_frsk_gdf = gpd.read_file(files_dict['hopewell_frsk'])
-            self.hopewell_fhz_gdf = gpd.read_file(files_dict['hopewell_fhz'])
-            self.hopewell_wet_gdf = gpd.read_file(files_dict['hopewell_wet'])
-            self.hopewell_con_gdf = gpd.read_file(files_dict['hopewell_con'])
-            self.actv_mpo_gdf = gpd.read_file(files_dict['actv_mpo'])
-            self.t6_gdf = gpd.read_file(files_dict['t6'])
-            
-            # Add project_id if not present
-            if "project_id" not in self.projects_gdf.columns:
-                self.projects_gdf["project_id"] = range(1, len(self.projects_gdf) + 1)
-                
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error loading geospatial data: {str(e)}")
-    
-    def calculate_safety_frequency(self) -> pd.DataFrame:
-        """Calculate safety frequency score based on crash data"""
-        try:
-            # Ensure projected CRS for buffer
-            gdf = self.projects_gdf.to_crs(epsg=2263)  # feet
-            crashes = self.crashes_gdf.to_crs(gdf.crs)
-            
-            # Create 250 ft buffer
-            gdf_buffered = gdf.copy()
-            gdf_buffered["geometry"] = gdf_buffered.geometry.buffer(250)
-            
-            # Select crashes that intersect buffer
-            crashes_in_buffer = gpd.sjoin(
-                crashes,
-                gdf_buffered[["project_id", "geometry"]],
-                how="inner",
-                predicate="intersects"
-            )
-            
-            # Summarize crash people counts per buffer
-            crash_cols = []
-            for col in ["K_PEOPLE", "A_PEOPLE", "B_PEOPLE", "C_PEOPLE"]:
-                if col in crashes_in_buffer.columns:
-                    crash_cols.append(col)
-            
-            if crash_cols:
-                crash_sums = crashes_in_buffer.groupby("project_id")[crash_cols].sum().reset_index()
-                # Merge summary back to buffers
-                gdf_buffered = gdf_buffered.merge(crash_sums, on="project_id", how="left")
-                gdf_buffered[crash_cols] = gdf_buffered[crash_cols].fillna(0)
-                
-                # Calculate EPDO
-                epdo_weights = {"K_PEOPLE": 2715000, "A_PEOPLE": 2715000, "B_PEOPLE": 300000, "C_PEOPLE": 170000}
-                gdf_buffered["EPDO"] = sum(gdf_buffered[col] * epdo_weights.get(col, 0) for col in crash_cols)
-                
-                # Calculate benefit = EPDO * (1 - cmf)
-                if "cmf" in gdf_buffered.columns:
-                    gdf_buffered["benefit"] = gdf_buffered["EPDO"] * (1 - gdf_buffered["cmf"])
-                else:
-                    gdf_buffered["benefit"] = gdf_buffered["EPDO"]
-            else:
-                gdf_buffered["benefit"] = 0
-            
-            # Calculate safety score
-            max_benefit = gdf_buffered["benefit"].max() if gdf_buffered["benefit"].max() > 0 else 1
-            gdf_buffered["safety_freq"] = (gdf_buffered["benefit"] / max_benefit) * 50
-            
-            return gdf_buffered[['project_id', 'safety_freq']]
-            
-        except Exception as e:
-            print(f"Error in safety frequency calculation: {e}")
-            # Return default values
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                'safety_freq': [0] * len(self.projects_gdf)
-            })
-    
-    def calculate_safety_rate(self, safety_freq_df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate safety rate score"""
-        try:
-            gdf_buffered = self.projects_gdf.merge(safety_freq_df, on="project_id", how="left")
-            
-            # Function to calculate epdo_rate and VMT
-            def calculate_epdo_rate_and_vmt(row):
-                if "benefit" not in row or pd.isna(row.get("benefit", 0)):
-                    benefit = row.get("safety_freq", 0) * 100  # Estimate benefit from frequency
-                else:
-                    benefit = row["benefit"]
-                    
-                if row.get("type", "").lower() == "highway":
-                    vmt = row.get("AADT", 10000) * row.get("length", 1) * 365 / 100_000_000
-                elif row.get("type", "").lower() == "intersection":
-                    vmt = row.get("AADT", 10000) * 365 / 1_000_000
-                else:
-                    vmt = 1
-                
-                epdo_rate = benefit / vmt if vmt != 0 else 0
-                return pd.Series({"VMT": vmt, "epdo_rate": epdo_rate})
-            
-            gdf_buffered[["VMT", "epdo_rate"]] = gdf_buffered.apply(calculate_epdo_rate_and_vmt, axis=1)
-            
-            # Calculate safety_rate
-            max_rate = gdf_buffered["epdo_rate"].max() if gdf_buffered["epdo_rate"].max() > 0 else 1
-            gdf_buffered["safety_rate"] = (gdf_buffered["epdo_rate"] / max_rate) * 50
-            
-            return gdf_buffered[['project_id', 'safety_rate']]
-            
-        except Exception as e:
-            print(f"Error in safety rate calculation: {e}")
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                'safety_rate': [0] * len(self.projects_gdf)
-            })
-    
-    def calculate_congestion_demand(self) -> pd.DataFrame:
-        """Calculate congestion demand score"""
-        try:
-            projects = self.projects_gdf.to_crs(epsg=2283)
-            aadt = self.aadt_gdf.to_crs(projects.crs)
-            
-            buffer_distance = 0.25 * 1609.34  # meters
-            projects["buffer"] = projects.geometry.buffer(buffer_distance)
-            project_buffers = projects.set_geometry("buffer")
-            
-            # Perform spatial join
-            intersected = gpd.sjoin(aadt, project_buffers, how="inner", predicate="intersects")
-            
-            # Calculate weighted average AADT
-            intersected["segment_mileage"] = intersected.geometry.length / 1609.34
-            
-            # Handle different AADT column names
-            aadt_col = None
-            for col in ["aadt_0", "aadt", "AADT", "volume"]:
-                if col in intersected.columns:
-                    aadt_col = col
-                    break
-            
-            if aadt_col:
-                intersected["vmt"] = intersected[aadt_col] * intersected["segment_mileage"]
-                wa_aadt = (
-                    intersected.groupby("project_id")
-                    .apply(lambda x: x["vmt"].sum() / x["segment_mileage"].sum() if x["segment_mileage"].sum() > 0 else 0, include_groups=False)
-                    .reset_index(name="wa_aadt")
-                )
-            else:
-                # Use default values if no AADT column found
-                wa_aadt = pd.DataFrame({
-                    'project_id': projects['project_id'],
-                    'wa_aadt': [10000] * len(projects)
-                })
-            
-            projects = projects.merge(wa_aadt, on="project_id", how="left")
-            projects["wa_aadt"] = projects["wa_aadt"].fillna(0)
-            
-            # Normalize
-            max_aadt = projects["wa_aadt"].max() if projects["wa_aadt"].max() > 0 else 1
-            projects["cong_demand"] = (projects["wa_aadt"] / max_aadt) * 10
-            
-            return projects[['project_id', 'cong_demand']]
-            
-        except Exception as e:
-            print(f"Error in congestion demand calculation: {e}")
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                'cong_demand': [0] * len(self.projects_gdf)
-            })
-    
-    def calculate_congestion_los(self) -> pd.DataFrame:
-        """Calculate congestion level of service score"""
-        try:
-            projects = self.projects_gdf.to_crs(epsg=3857)
-            aadt = self.aadt_gdf.to_crs(epsg=3857)
-            
-            # LOS mapping
-            los_mapping = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 3, "F": 3}
-            
-            # Handle different LOS column names
-            los_col = None
-            for col in ["los_0", "los", "LOS", "level_of_service"]:
-                if col in aadt.columns:
-                    los_col = col
-                    break
-            
-            if los_col:
-                aadt["cong_value"] = aadt[los_col].map(los_mapping).fillna(0)
-            else:
-                aadt["cong_value"] = 0
-            
-            # Create buffer and intersect
-            projects["buffer"] = projects.geometry.buffer(402.336)  # 0.25 miles
-            project_buffers = gpd.GeoDataFrame(projects[['project_id']], geometry=projects['buffer'])
-            intersected = gpd.overlay(aadt, project_buffers, how="intersection")
-            
-            # Sum congestion values
-            project_cong = intersected.groupby("project_id")["cong_value"].sum().reset_index(name="sum_cong_value")
-            projects = projects.merge(project_cong, on="project_id", how="left")
-            projects["sum_cong_value"] = projects["sum_cong_value"].fillna(0)
-            
-            # Normalize
-            max_cong = projects["sum_cong_value"].max() if projects["sum_cong_value"].max() > 0 else 1
-            normalized = (projects["sum_cong_value"] / max_cong) * 5
-            projects["cong_los"] = normalized.where(normalized % 1 == 0, 0)
-            
-            return projects[['project_id', 'cong_los']]
-            
-        except Exception as e:
-            print(f"Error in congestion LOS calculation: {e}")
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                'cong_los': [0] * len(self.projects_gdf)
-            })
-    
-    def calculate_access_to_jobs(self) -> pd.DataFrame:
-        """Calculate access to jobs score"""
-        try:
-            fc_distances_miles = {"PA": 10, "MA": 7.5, "MC": 5}
-            mile_to_meter = 1609.34
-            fc_distances_m = {k: v * mile_to_meter for k, v in fc_distances_miles.items()}
-            
-            projects = self.projects_gdf.to_crs(epsg=2283)
-            pop_emp_df = self.pop_emp_gdf.to_crs(epsg=2283)
-            pop_emp_df["centroid"] = pop_emp_df.geometry.centroid
-            
-            results = []
-            
-            for _, proj in projects.iterrows():
-                fc = proj.get("fc", "MA")  # Default to MA if fc not found
-                buffer_dist = fc_distances_m.get(fc, fc_distances_m["MA"])
-                
-                proj_buffer = proj.geometry.buffer(buffer_dist)
-                selected = pop_emp_df[pop_emp_df["centroid"].within(proj_buffer)]
-                
-                # Handle different employment column names
-                emp17_col = next((col for col in ["emp17", "emp_17", "employment_2017", "emp2017"] if col in selected.columns), None)
-                emp50_col = next((col for col in ["emp50", "emp_50", "employment_2050", "emp2050"] if col in selected.columns), None)
-                
-                if emp17_col and emp50_col:
-                    sum_emp17 = selected[emp17_col].sum()
-                    sum_emp50 = selected[emp50_col].sum()
-                    pct_change = ((sum_emp50 - sum_emp17) / sum_emp17 * 100) if sum_emp17 != 0 else 0
-                else:
-                    pct_change = 0
-                
-                results.append({
-                    "project_id": proj["project_id"],
-                    "pct_change": pct_change
-                })
-            
-            results_df = pd.DataFrame(results)
-            max_change = results_df["pct_change"].max() if results_df["pct_change"].max() > 0 else 1
-            results_df["jobs_pc"] = (results_df["pct_change"] / max_change) * 5
-            
-            return results_df[['project_id', 'jobs_pc']]
-            
-        except Exception as e:
-            print(f"Error in access to jobs calculation: {e}")
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                'jobs_pc': [0] * len(self.projects_gdf)
-            })
-    
-    def _calculate_job_access_metric(self, ej_only: bool = False) -> pd.DataFrame:
-        """Helper function to calculate job access metrics, with an option for EJ areas."""
-        fc_distances_miles = {"PA": 10, "MA": 7.5, "MC": 5}
-        mile_to_meter = 1609.34
-        fc_distances_m = {k: v * mile_to_meter for k, v in fc_distances_miles.items()}
-
-        projects = self.projects_gdf.to_crs(epsg=2283)
-        pop_emp_df = self.pop_emp_gdf.to_crs(epsg=2283)
+        # Create buffer
+        proj_buffer = proj.geometry.buffer(buffer_dist)
         
-        if ej_only:
-            ej = self.ej_gdf.to_crs(epsg=2283)
-            # Intersect pop_emp data with EJ areas once, for efficiency
-            pop_emp_df = gpd.overlay(pop_emp_df, ej, how="intersection")
-            if pop_emp_df.empty:
-                return pd.DataFrame({'project_id': projects['project_id'], 'pct_change': [0] * len(projects)})
-
-        pop_emp_df["centroid"] = pop_emp_df.geometry.centroid
-
-        results = []
-        for _, proj in projects.iterrows():
-            fc = proj.get("fc", "MA")
-            buffer_dist = fc_distances_m.get(fc, fc_distances_m["MA"])
-            
-            proj_buffer = proj.geometry.buffer(buffer_dist)
-            
-            # Use pre-filtered pop_emp_df for EJ case
-            selected = pop_emp_df[pop_emp_df["centroid"].within(proj_buffer)]
-            
-            emp17_col = next((col for col in ["emp17", "emp_17", "employment_2017", "emp2017"] if col in selected.columns), None)
-            emp50_col = next((col for col in ["emp50", "emp_50", "employment_2050", "emp2050"] if col in selected.columns), None)
-            
-            if emp17_col and emp50_col and not selected.empty:
-                sum_emp17 = selected[emp17_col].sum()
-                sum_emp50 = selected[emp50_col].sum()
-                pct_change = ((sum_emp50 - sum_emp17) / sum_emp17 * 100) if sum_emp17 != 0 else 0
-            else:
-                pct_change = 0
-            
-            results.append({"project_id": proj["project_id"], "pct_change": pct_change})
+        # Select TAZs with centroid inside buffer
+        selected = pop_emp_df[pop_emp_df["centroid"].within(proj_buffer)]
         
-        return pd.DataFrame(results)
-
-    def calculate_access_to_jobs_ej(self) -> pd.DataFrame:
-        """Calculate access to jobs in EJ areas score"""
-        try:
-            results_df = self._calculate_job_access_metric(ej_only=True)
-            max_change = results_df["pct_change"].max() if results_df["pct_change"].max() > 0 else 1
-            results_df["jobs_pc_ej"] = (results_df["pct_change"] / max_change) * 5
-            return results_df[['project_id', 'jobs_pc_ej']]
-        except Exception as e:
-            print(f"Error in access to jobs EJ calculation: {e}")
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                'jobs_pc_ej': [0] * len(self.projects_gdf)
-            })
-
-    def calculate_access_to_nw(self) -> pd.DataFrame:
-        """Calculate access to non-work destinations score"""
-        try:
-            fc_distances_miles = {"PA": 10, "MA": 7.5, "MC": 5}
-            mile_to_meter = 1609.34
-            fc_distances_m = {k: v * mile_to_meter for k, v in fc_distances_miles.items()}
-            
-            projects = self.projects_gdf.to_crs(epsg=2283)
-            nw = self.nw_gdf.to_crs(epsg=2283)
-            pop_emp_df = self.pop_emp_gdf.to_crs(epsg=2283)
-            
-            results = []
-            
-            for _, proj in projects.iterrows():
-                fc = proj.get("fc", "MA")
-                buffer_dist = fc_distances_m.get(fc, fc_distances_m["MA"])
-                
-                proj_buffer = proj.geometry.buffer(buffer_dist)
-                nw_count = nw[nw.within(proj_buffer)].shape[0]
-                taz_selected = pop_emp_df[pop_emp_df.intersects(proj_buffer)]
-                
-                if taz_selected.empty:
-                    density_change = 0
-                else:
-                    # Get employment and population columns
-                    emp17_col = next((col for col in ["emp17", "emp_17", "employment_2017"] if col in taz_selected.columns), None)
-                    emp50_col = next((col for col in ["emp50", "emp_50", "employment_2050"] if col in taz_selected.columns), None)
-                    pop17_col = next((col for col in ["pop17", "pop_17", "population_2017"] if col in taz_selected.columns), None)
-                    pop50_col = next((col for col in ["pop50", "pop_50", "population_2050"] if col in taz_selected.columns), None)
-                    
-                    sum_emp2017 = taz_selected[emp17_col].sum() if emp17_col else 0
-                    sum_emp2050 = taz_selected[emp50_col].sum() if emp50_col else 0
-                    sum_pop2017 = taz_selected[pop17_col].sum() if pop17_col else 0
-                    sum_pop2050 = taz_selected[pop50_col].sum() if pop50_col else 0
-                    
-                    area_sqmi = taz_selected.to_crs(epsg=3857).geometry.area.sum() / (1609.34**2)
-                    
-                    if area_sqmi > 0:
-                        pop_emp_den_2017 = nw_count * (sum_emp2017 + sum_pop2017) / area_sqmi
-                        pop_emp_den_2050 = nw_count * (sum_emp2050 + sum_pop2050) / area_sqmi
-                        density_change = ((pop_emp_den_2050 - pop_emp_den_2017) / pop_emp_den_2017 * 100) if pop_emp_den_2017 != 0 else 0
-                    else:
-                        density_change = 0
-                
-                results.append({
-                    "project_id": proj["project_id"],
-                    "access_nw_pct": density_change
-                })
-            
-            results_df = pd.DataFrame(results)
-            max_pct = results_df["access_nw_pct"].max() if results_df["access_nw_pct"].max() > 0 else 1
-            results_df["access_nw_norm"] = (results_df["access_nw_pct"] / max_pct) * 5
-            
-            return results_df[['project_id', 'access_nw_norm']]
-            
-        except Exception as e:
-            print(f"Error in access to non-work destinations calculation: {e}")
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                'access_nw_norm': [0] * len(self.projects_gdf)
-            })
+        # Aggregate employment
+        sum_emp17 = selected["emp17"].sum()
+        sum_emp50 = selected["emp50"].sum()
+        
+        # % change
+        pct_change = ((sum_emp50 - sum_emp17) / sum_emp17 * 100) if sum_emp17 != 0 else 0
+        
+        results.append({
+            "project_id": proj["project_id"],
+            "sum_emp17": sum_emp17,
+            "sum_emp50": sum_emp50,
+            "pct_change": pct_change
+        })
     
-    def calculate_access_to_nw_ej(self) -> pd.DataFrame:
-        """Calculate access to non-work destinations in EJ areas score"""
-        try:
-            fc_distances_miles = {"PA": 10, "MA": 7.5, "MC": 5}
-            mile_to_meter = 1609.34
-            fc_distances_m = {k: v * mile_to_meter for k, v in fc_distances_miles.items()}
-            
-            projects = self.projects_gdf.to_crs(epsg=2283)
-            nw = self.nw_gdf.to_crs(epsg=2283)
-            pop_emp_df = self.pop_emp_gdf.to_crs(epsg=2283)
-            ej = self.ej_gdf.to_crs(epsg=2283)
-            
-            results = []
-            
-            for _, proj in projects.iterrows():
-                fc = proj.get("fc", "MA")
-                buffer_dist = fc_distances_m.get(fc, fc_distances_m["MA"])
-                
-                proj_buffer = proj.geometry.buffer(buffer_dist)
-                
-                try:
-                    ej_union = ej.union_all() if hasattr(ej, 'union_all') else ej.unary_union
-                    nw_count = nw[nw.within(proj_buffer) & nw.within(ej_union)].shape[0]
-                    taz_selected = pop_emp_df[pop_emp_df.intersects(proj_buffer) & pop_emp_df.intersects(ej_union)]
-                except:
-                    nw_count = 0
-                    taz_selected = gpd.GeoDataFrame()
-                
-                if taz_selected.empty:
-                    density_change = 0
-                else:
-                    # Similar calculation as non-EJ version
-                    emp17_col = next((col for col in ["emp17", "emp_17", "employment_2017"] if col in taz_selected.columns), None)
-                    emp50_col = next((col for col in ["emp50", "emp_50", "employment_2050"] if col in taz_selected.columns), None)
-                    pop17_col = next((col for col in ["pop17", "pop_17", "population_2017"] if col in taz_selected.columns), None)
-                    pop50_col = next((col for col in ["pop50", "pop_50", "population_2050"] if col in taz_selected.columns), None)
-                    
-                    sum_emp2017 = taz_selected[emp17_col].sum() if emp17_col else 0
-                    sum_emp2050 = taz_selected[emp50_col].sum() if emp50_col else 0
-                    sum_pop2017 = taz_selected[pop17_col].sum() if pop17_col else 0
-                    sum_pop2050 = taz_selected[pop50_col].sum() if pop50_col else 0
-                    
-                    area_sqmi = taz_selected.to_crs(epsg=3857).geometry.area.sum() / (1609.34**2)
-                    
-                    if area_sqmi > 0:
-                        pop_emp_den_2017 = nw_count * (sum_emp2017 + sum_pop2017) / area_sqmi
-                        pop_emp_den_2050 = nw_count * (sum_emp2050 + sum_pop2050) / area_sqmi
-                        density_change = ((pop_emp_den_2050 - pop_emp_den_2017) / pop_emp_den_2017 * 100) if pop_emp_den_2017 != 0 else 0
-                    else:
-                        density_change = 0
-                
-                results.append({
-                    "project_id": proj["project_id"],
-                    "access_nw_pct": density_change
-                })
-            
-            results_df = pd.DataFrame(results)
-            max_pct = results_df["access_nw_pct"].max() if results_df["access_nw_pct"].max() > 0 else 1
-            results_df["access_nw_ej_norm"] = (results_df["access_nw_pct"] / max_pct) * 5
-            
-            return results_df[['project_id', 'access_nw_ej_norm']]
-            
-        except Exception as e:
-            print(f"Error in access to non-work destinations EJ calculation: {e}")
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                'access_nw_ej_norm': [0] * len(self.projects_gdf)
-            })
-
-    def _calculate_resiliency_score(self, resiliency_gdf: gpd.GeoDataFrame, score_name: str, weight: int) -> pd.DataFrame:
-        """Generic function to calculate a resiliency score based on intersection with a given layer."""
-        try:
-            projects = self.projects_gdf.to_crs(epsg=2283)
-            resiliency_layer = resiliency_gdf.to_crs(projects.crs)
-
-            # Check if project intersects with the resiliency layer
-            intersect_check = gpd.sjoin(projects, resiliency_layer, how='left', predicate='intersects')
-            intersect_check[score_name] = np.where(intersect_check['index_right'].notna(), weight, 0)
-            
-            # Consolidate results per project
-            final_scores = intersect_check.groupby('project_id')[score_name].max().reset_index()
-
-            return final_scores[['project_id', score_name]]
-        except Exception as e:
-            print(f"Error in {score_name} calculation: {e}")
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                score_name: [0] * len(self.projects_gdf)
-            })
-
-    def calculate_resiliency_scores(self) -> List[pd.DataFrame]:
-        """Calculate all resiliency-related scores."""
-        scores = []
-        # Flood Risk (frsk)
-        scores.append(self._calculate_resiliency_score(self.hopewell_frsk_gdf, 'resiliency_frsk', 5))
-        # Flood Hazard Zone (fhz)
-        scores.append(self._calculate_resiliency_score(self.hopewell_fhz_gdf, 'resiliency_fhz', 5))
-        # Wetlands (wet)
-        scores.append(self._calculate_resiliency_score(self.hopewell_wet_gdf, 'resiliency_wet', 5))
-        # Conservation (con)
-        scores.append(self._calculate_resiliency_score(self.hopewell_con_gdf, 'resiliency_con', 5))
-        return scores
-
-    def calculate_activity_center_access(self) -> pd.DataFrame:
-        """Calculate score based on access to activity centers."""
-        try:
-            projects = self.projects_gdf.to_crs(epsg=2283)
-            activity_centers = self.actv_mpo_gdf.to_crs(projects.crs)
-
-            # Define a buffer around projects to check for nearby activity centers
-            buffer_distance = 0.5 * 1609.34  # 0.5 miles in meters
-            projects['buffer'] = projects.geometry.buffer(buffer_distance)
-            project_buffers = projects.set_geometry('buffer')
-
-            # Join projects with activity centers that fall within the buffer
-            joined = gpd.sjoin(project_buffers, activity_centers, how='left', predicate='intersects')
-
-            # A simple score: 5 points if it provides access to any activity center
-            joined['actv_center_score'] = np.where(joined['index_right'].notna(), 5, 0)
-            
-            # Group by project to get a single score per project
-            final_scores = joined.groupby('project_id')['actv_center_score'].max().reset_index()
-
-            return final_scores[['project_id', 'actv_center_score']]
-        except Exception as e:
-            print(f"Error in activity center access calculation: {e}")
-            return pd.DataFrame({
-                'project_id': self.projects_gdf['project_id'],
-                'actv_center_score': [0] * len(self.projects_gdf)
-            })
+    # Convert to DataFrame
+    results_df = pd.DataFrame(results)
     
-    def calculate_final_scores(self) -> Dict[str, Any]:
-        """Calculate all scores and final ranking"""
-        try:
-            # Calculate all individual scores
-            safety_freq = self.calculate_safety_frequency()
-            safety_rate = self.calculate_safety_rate(safety_freq)
-            cong_demand = self.calculate_congestion_demand()
-            cong_los = self.calculate_congestion_los()
-            eq_acc_jobs = self.calculate_access_to_jobs()
-            eq_acc_jobs_ej = self.calculate_access_to_jobs_ej()
-            eq_acc_nw = self.calculate_access_to_nw()
-            eq_acc_nw_ej = self.calculate_access_to_nw_ej()
-            resiliency_scores_dfs = self.calculate_resiliency_scores()
-            actv_center_score = self.calculate_activity_center_access()
-            
-            # Merge all scores
-            dfs = [safety_freq, safety_rate, cong_demand, cong_los, 
-                   eq_acc_jobs, eq_acc_jobs_ej, eq_acc_nw, eq_acc_nw_ej,
-                   actv_center_score] + resiliency_scores_dfs
-            
-            merged_data = reduce(lambda left, right: pd.merge(left, right, on="project_id", how="outer"), dfs)
-            
-            # Merge with original project data
-            final_gdf = self.projects_gdf.merge(merged_data, on="project_id", how="left")
-            
-            # Define all score columns and fill NaN values with 0
-            score_columns = [
-                'safety_freq', 'safety_rate', 'cong_demand', 'cong_los', 
-                'jobs_pc', 'jobs_pc_ej', 'access_nw_norm', 'access_nw_ej_norm',
-                'resiliency_frsk', 'resiliency_fhz', 'resiliency_wet', 'resiliency_con', 'actv_center_score'
-            ]
-            final_gdf[score_columns] = final_gdf[score_columns].fillna(0)
-            
-            # Calculate total benefit
-            final_gdf['benefit'] = final_gdf[score_columns].sum(axis=1)
-            
-            # Calculate BCR
-            cost_col = next((col for col in ["cost_mil", "cost", "cost_million"] if col in final_gdf.columns), None)
-            if cost_col:
-                final_gdf['bcr'] = final_gdf['benefit'] / final_gdf[cost_col].replace(0, 1)  # Avoid division by zero
-            else:
-                final_gdf['bcr'] = final_gdf['benefit']  # Default if no cost column
-            
-            # Calculate rank
-            final_gdf['rank'] = final_gdf['bcr'].rank(ascending=False, method='dense').astype(int)
-            
-            # Convert to serializable format
-            results = []
-            for _, row in final_gdf.iterrows():
-                project_result = {
-                    'project_id': int(row['project_id']),
-                    'type': str(row.get('type', 'Unknown')),
-                    'county': str(row.get('county', 'Unknown')),
-                    'safety_freq': float(row.get('safety_freq', 0)),
-                    'safety_rate': float(row.get('safety_rate', 0)),
-                    'cong_demand': float(row.get('cong_demand', 0)),
-                    'cong_los': float(row.get('cong_los', 0)),
-                    'jobs_pc': float(row.get('jobs_pc', 0)),
-                    'jobs_pc_ej': float(row.get('jobs_pc_ej', 0)),
-                    'access_nw_norm': float(row.get('access_nw_norm', 0)),
-                    'access_nw_ej_norm': float(row.get('access_nw_ej_norm', 0)),
-                    'resiliency_frsk': float(row.get('resiliency_frsk', 0)),
-                    'resiliency_fhz': float(row.get('resiliency_fhz', 0)),
-                    'resiliency_wet': float(row.get('resiliency_wet', 0)),
-                    'resiliency_con': float(row.get('resiliency_con', 0)),
-                    'actv_center_score': float(row.get('actv_center_score', 0)),
-                    'benefit': float(row.get('benefit', 0)),
-                    'cost_mil': float(row.get(cost_col, 1)) if cost_col else 1.0,
-                    'bcr': float(row.get('bcr', 0)),
-                    'rank': int(row.get('rank', 999))
-                }
-                results.append(project_result)
-            
-            # Sort by rank
-            results_sorted = sorted(results, key=lambda x: x['rank'])
+    results_df["jobs_pc"] = (results_df["pct_change"] / results_df["pct_change"].max()) * 5 if results_df["pct_change"].max() != 0 else 0
+    
+    results_df = results_df[['project_id', 'jobs_pc']]
+    
+    return results_df
 
-            summary = {
-                "total_projects": len(results_sorted),
-                "total_cost": sum(p['cost_mil'] for p in results_sorted)
-            }
+# =============================================================================
+# 6. EQUITY/ACCESS - ACCESS TO JOBS (ENVIRONMENTAL JUSTICE)
+# =============================================================================
 
-            return {"projects": results_sorted, "summary": summary}
+def analyze_equity_access_jobs_ej(projects_gdf, popemp_gdf, t6_gdf):
+    """Analyze equity and access to jobs in environmental justice areas"""
+    
+    # Load datasets
+    pop_emp_df = popemp_gdf.copy()
+    ej = t6_gdf.copy()
+    projects = projects_gdf.copy()
+    
+    # Distances in miles → meters
+    fc_distances_miles = {"PA": 10, "MA": 7.5, "MC": 5}
+    mile_to_meter = 1609.34
+    fc_distances_m = {k: v * mile_to_meter for k, v in fc_distances_miles.items()}
+    
+    # Project all layers to a projected CRS
+    projects = projects.to_crs(epsg=2283)
+    pop_emp_df = pop_emp_df.to_crs(epsg=2283)
+    ej = ej.to_crs(epsg=2283)
+    
+    results = []
+    
+    # Loop through projects
+    for _, proj in projects.iterrows():
+        fc = proj["fc"]
+        buffer_dist = fc_distances_m[fc]
+        
+        # Create buffer
+        proj_buffer = proj.geometry.buffer(buffer_dist)
+        
+        # Clip EJ polygons within buffer
+        ej_clip = ej[ej.intersects(proj_buffer)]
+        
+        if ej_clip.empty:
+            sum_emp17 = 0
+            sum_emp50 = 0
+        else:
+            # Clip TAZ by EJ polygons (intersection)
+            taz_ej_intersect = gpd.overlay(pop_emp_df, ej_clip, how="intersection")
+            
+            # Aggregate employment in intersected areas
+            sum_emp17 = taz_ej_intersect["emp17"].sum()
+            sum_emp50 = taz_ej_intersect["emp50"].sum()
+        
+        # % change
+        pct_change = ((sum_emp50 - sum_emp17) / sum_emp17 * 100) if sum_emp17 != 0 else 0
+        
+        results.append({
+            "project_id": proj["project_id"],
+            "sum_emp17": sum_emp17,
+            "sum_emp50": sum_emp50,
+            "pct_change": pct_change
+        })
+    
+    # Results DataFrame
+    results_df = pd.DataFrame(results)
+    
+    # Normalize percent change
+    results_df["jobs_pc_ej"] = (results_df["pct_change"] / results_df["pct_change"].max()) * 5 if results_df["pct_change"].max() != 0 else 0
+    results_df = results_df[['project_id', 'jobs_pc_ej']]
+    
+    return results_df
 
-        except Exception as e:
-            print(f"Error in final score calculation: {e}")
-            return {
-                "projects": [],
-                "summary": {"error": str(e)}
-            }
+# =============================================================================
+# 7. ACCESS TO NON-WORK DESTINATIONS
+# =============================================================================
+
+def analyze_access_non_work(projects_gdf, popemp_gdf, nw_gdf):
+    """Analyze access to non-work destinations"""
+    
+    # Load datasets
+    pop_emp_df = popemp_gdf.copy()
+    nw = nw_gdf.copy()
+    projects = projects_gdf.copy()
+    
+    # Distances (miles -> meters)
+    fc_distances_miles = {"PA": 10, "MA": 7.5, "MC": 5}
+    mile_to_meter = 1609.34
+    fc_distances_m = {k: v * mile_to_meter for k, v in fc_distances_miles.items()}
+    
+    # Project to planar CRS
+    projects = projects.to_crs(epsg=2283)
+    nw = nw.to_crs(epsg=2283)
+    pop_emp_df = pop_emp_df.to_crs(epsg=2283)
+    
+    results = []
+    
+    for _, proj in projects.iterrows():
+        fc = proj["fc"]
+        buffer_dist = fc_distances_m[fc]
+        
+        # Buffer project
+        proj_buffer = proj.geometry.buffer(buffer_dist)
+        
+        # Count NW points inside buffer
+        nw_count = nw[nw.within(proj_buffer)].shape[0]
+        
+        # Intersect TAZs with buffer
+        taz_selected = pop_emp_df[pop_emp_df.intersects(proj_buffer)]
+        
+        if taz_selected.empty:
+            sum_emp2017 = sum_emp2050 = sum_pop2017 = sum_pop2050 = area_sqmi = 0
+        else:
+            sum_emp2017 = taz_selected["emp17"].sum()
+            sum_emp2050 = taz_selected["emp50"].sum()
+            sum_pop2017 = taz_selected["pop17"].sum()
+            sum_pop2050 = taz_selected["pop50"].sum()
+            
+            # area in square miles
+            area_sqmi = taz_selected.to_crs(epsg=3857).geometry.area.sum() / (1609.34**2)
+        
+        # Calculate density metrics
+        if area_sqmi > 0:
+            pop_emp_den_2017 = nw_count * (sum_emp2017 + sum_pop2017) / area_sqmi
+            pop_emp_den_2050 = nw_count * (sum_emp2050 + sum_pop2050) / area_sqmi
+        else:
+            pop_emp_den_2017 = pop_emp_den_2050 = 0
+        
+        results.append({
+            "project_id": proj["project_id"],
+            "nw_count": nw_count,
+            "sum_emp2017": sum_emp2017,
+            "sum_emp2050": sum_emp2050,
+            "sum_pop2017": sum_pop2017,
+            "sum_pop2050": sum_pop2050,
+            "area_sqmi": area_sqmi,
+            "pop_emp_den_2017": pop_emp_den_2017,
+            "pop_emp_den_2050": pop_emp_den_2050
+        })
+    
+    # Results dataframe
+    results_df = pd.DataFrame(results)
+    
+    # Percent change in pop_emp_den
+    results_df["access_nw_pct"] = (
+        ((results_df["pop_emp_den_2050"] - results_df["pop_emp_den_2017"]) / results_df["pop_emp_den_2017"] * 100)
+        .fillna(0)  # handle division by zero
+    )
+    
+    # Normalize percent change to 0–5 scale
+    results_df["access_nw_norm"] = (
+        (results_df["access_nw_pct"] / results_df["access_nw_pct"].max() * 5) 
+        if results_df["access_nw_pct"].max() != 0 else 0
+    )
+    
+    results_df = results_df[['project_id', 'access_nw_norm']]
+    
+    return results_df
+
+# =============================================================================
+# 8. ACCESS TO NON-WORK DESTINATIONS (ENVIRONMENTAL JUSTICE)
+# =============================================================================
+
+def analyze_access_non_work_ej(projects_gdf, popemp_gdf, nw_gdf, t6_gdf):
+    """Analyze access to non-work destinations in environmental justice areas"""
+    
+    # Load datasets
+    pop_emp_df = popemp_gdf.copy()
+    nw = nw_gdf.copy()
+    t6 = t6_gdf.copy()
+    projects = projects_gdf.copy()
+    
+    # Distances (miles -> meters)
+    fc_distances_miles = {"PA": 10, "MA": 7.5, "MC": 5}
+    mile_to_meter = 1609.34
+    fc_distances_m = {k: v * mile_to_meter for k, v in fc_distances_miles.items()}
+    
+    # Project to planar CRS
+    projects = projects.to_crs(epsg=2283)
+    nw = nw.to_crs(epsg=2283)
+    pop_emp_df = pop_emp_df.to_crs(epsg=2283)
+    t6 = t6.to_crs(epsg=2283)
+    
+    results = []
+    
+    for _, proj in projects.iterrows():
+        fc = proj["fc"]
+        buffer_dist = fc_distances_m[fc]
+        
+        # Buffer project
+        proj_buffer = proj.geometry.buffer(buffer_dist)
+        
+        # Count NW points inside buffer AND inside T6 polygon
+        nw_count = nw[nw.within(proj_buffer) & nw.within(t6.unary_union)].shape[0]
+        
+        # Intersect TAZs with buffer AND T6 polygon
+        taz_selected = pop_emp_df[pop_emp_df.intersects(proj_buffer) & pop_emp_df.intersects(t6.unary_union)]
+        
+        if taz_selected.empty:
+            sum_emp2017 = sum_emp2050 = sum_pop2017 = sum_pop2050 = area_sqmi = 0
+        else:
+            sum_emp2017 = taz_selected["emp17"].sum()
+            sum_emp2050 = taz_selected["emp50"].sum()
+            sum_pop2017 = taz_selected["pop17"].sum()
+            sum_pop2050 = taz_selected["pop50"].sum()
+            
+            # area in square miles
+            area_sqmi = taz_selected.to_crs(epsg=3857).geometry.area.sum() / (1609.34**2)
+        
+        # Calculate density metrics
+        if area_sqmi > 0:
+            pop_emp_den_2017 = nw_count * (sum_emp2017 + sum_pop2017) / area_sqmi
+            pop_emp_den_2050 = nw_count * (sum_emp2050 + sum_pop2050) / area_sqmi
+        else:
+            pop_emp_den_2017 = pop_emp_den_2050 = 0
+        
+        results.append({
+            "project_id": proj["project_id"],
+            "nw_count": nw_count,
+            "sum_emp2017": sum_emp2017,
+            "sum_emp2050": sum_emp2050,
+            "sum_pop2017": sum_pop2017,
+            "sum_pop2050": sum_pop2050,
+            "area_sqmi": area_sqmi,
+            "pop_emp_den_2017": pop_emp_den_2017,
+            "pop_emp_den_2050": pop_emp_den_2050
+        })
+    
+    # Results dataframe
+    results_df = pd.DataFrame(results)
+    
+    # Percent change in pop_emp_den
+    results_df["access_nw_pct"] = (
+        ((results_df["pop_emp_den_2050"] - results_df["pop_emp_den_2017"]) / results_df["pop_emp_den_2017"] * 100)
+        .fillna(0)  # handle division by zero
+    )
+    
+    # Normalize percent change to 0–5 scale
+    max_pct = results_df["access_nw_pct"].max()
+    results_df["access_nw_ej_norm"] = (results_df["access_nw_pct"] / max_pct * 5) if max_pct != 0 else 0
+    
+    results_df = results_df[['project_id', 'access_nw_ej_norm']]
+    
+    return results_df
+
+# =============================================================================
+# 9. SENSITIVE FEATURES ANALYSIS
+# =============================================================================
+
+def analyze_sensitive_features(projects_gdf, fhz_gdf, frsk_gdf, wet_gdf, con_gdf):
+    """Analyze impact on sensitive environmental features"""
+    
+    # Load sensitive feature datasets
+    fhz = fhz_gdf.copy()
+    frsk = frsk_gdf.copy()
+    wet = wet_gdf.copy()
+    con = con_gdf.copy()
+    
+    # Filter AE zones
+    fhz_filtered = fhz[fhz['FLD_ZONE'] == 'AE']
+    
+    # Buffer flood risk areas
+    gdf = frsk.copy()
+    if frsk.crs is None or not frsk.crs.is_projected:
+        gdf = frsk.to_crs('EPSG:2264')
+    
+    frsk_buff = frsk.buffer(200)
+    frsk_buff = gpd.GeoDataFrame(geometry=frsk_buff, crs=frsk.crs)
+    
+    # Combine all sensitive areas
+    gdf1 = fhz_filtered.copy()
+    gdf2 = frsk_buff.copy()
+    gdf3 = wet.copy()
+    gdf4 = con.copy()
+    
+    # Ensure all have the same CRS
+    target_crs = gdf1.crs
+    gdf2 = gdf2.to_crs(target_crs)
+    gdf3 = gdf3.to_crs(target_crs)
+    gdf4 = gdf4.to_crs(target_crs)
+    
+    # Combine all GeoDataFrames
+    combined_gdf = gpd.GeoDataFrame(pd.concat([gdf1, gdf2, gdf3, gdf4], ignore_index=True))
+    
+    # Dissolve all geometries into one
+    sen_areas = combined_gdf.dissolve()
+    
+    # Load projects
+    gdf = projects_gdf.copy()
+    
+    # Create ¼-mile buffer around project points
+    utm_crs = gdf.estimate_utm_crs()
+    gdf_utm = gdf.to_crs(utm_crs)
+    
+    # Create ¼-mile buffer (402.336 meters) around each project point
+    buffer_distance_m = 402.336
+    project_buffers = gdf_utm.buffer(buffer_distance_m)
+    
+    # Convert back to GeoDataFrame with original project attributes
+    project_buffer_gdf = gpd.GeoDataFrame(
+        gdf.drop(columns='geometry'),  # Keep all attributes except original geometry
+        geometry=project_buffers,
+        crs=utm_crs
+    )
+    project_buffer_gdf = project_buffer_gdf.to_crs(gdf.crs)
+    
+    # Perform intersection between project buffers and sensitive areas
+    if project_buffer_gdf.crs != sen_areas.crs:
+        sen_areas = sen_areas.to_crs(project_buffer_gdf.crs)
+    
+    sen_areas_proj_buff = gpd.overlay(project_buffer_gdf, sen_areas, how='intersection')
+    
+    # Compute area in square miles
+    sen_areas_proj_buff["sen_area_sqmi"] = sen_areas_proj_buff.geometry.area / 2.59e6  # convert from m² to mi²
+    
+    cols = ["project_id", "type", "syip", "county", "cmf", "AADT", "length", "fc", "cost_mil", "tier", "sen_area_sqmi"]
+    sen_areas_proj_buff = sen_areas_proj_buff[cols + ["geometry"]]
+    
+    # Calculate impact based on project tier
+    def adjust_area(row):
+        if row["tier"] == "CE":
+            return row["sen_area_sqmi"] * 0.9
+        elif row["tier"] == "EA":
+            return row["sen_area_sqmi"] * 0.7
+        elif row["tier"] == "EIS":
+            return row["sen_area_sqmi"] * 0.5
+        else:
+            return row["sen_area_sqmi"]  # no reduction if tier not listed
+    
+    sen_areas_proj_buff["sen_impact"] = sen_areas_proj_buff.apply(adjust_area, axis=1)
+    
+    # Normalize environmental impact (lower impact is better, so we invert)
+    max_impact = sen_areas_proj_buff["sen_impact"].max()
+    if max_impact > 0:
+        sen_areas_proj_buff["env_impact_score"] = 10 - (sen_areas_proj_buff["sen_impact"] / max_impact * 10)
+    else:
+        sen_areas_proj_buff["env_impact_score"] = 10
+    
+    # Cap at 0
+    sen_areas_proj_buff["env_impact_score"] = sen_areas_proj_buff["env_impact_score"].clip(lower=0)
+    
+    env_scores = sen_areas_proj_buff[['project_id', 'env_impact_score']]
+    
+    return env_scores
+
+# =============================================================================
+# 10. JOB GROWTH ANALYSIS
+# =============================================================================
+
+def analyze_job_growth(projects_gdf, popemp_gdf):
+    """Analyze job growth in project areas"""
+    
+    # Load datasets
+    projects = projects_gdf.copy()
+    pop_emp = popemp_gdf.copy()
+    
+    # Ensure same CRS
+    if projects.crs != pop_emp.crs:
+        pop_emp = pop_emp.to_crs(projects.crs)
+    
+    # Define buffer distances (in meters)
+    mile_to_meter = 1609.34
+    buffer_distances = {"PA": 10 * mile_to_meter, "MA": 7.5 * mile_to_meter, "MC": 5 * mile_to_meter}
+    
+    # Create buffers
+    projects["buffer_dist"] = projects["fc"].map(buffer_distances)
+    projects_buffer = projects.copy()
+    projects_buffer["geometry"] = projects_buffer.geometry.buffer(projects_buffer["buffer_dist"])
+    
+    # Compute centroids of pop_emp features
+    pop_emp_centroids = pop_emp.copy()
+    pop_emp_centroids["geometry"] = pop_emp_centroids.geometry.centroid
+    
+    # Spatial join (points within buffers)
+    joined = gpd.sjoin(
+        pop_emp_centroids,
+        projects_buffer[["project_id", "geometry"]],
+        predicate="within"
+    )
+    
+    # Aggregate stats by project_id
+    agg_stats = (
+        joined.groupby("project_id", as_index=False)
+        .agg({
+            "pop17": "sum",
+            "pop50": "sum",
+            "emp17": "sum",
+            "emp50": "sum"
+        })
+    )
+    
+    # Compute job growth
+    agg_stats["job_growth"] = agg_stats["emp50"] - agg_stats["emp17"]
+    
+    # Normalize job growth (0-10 scale)
+    max_growth = agg_stats["job_growth"].max()
+    if max_growth > 0:
+        agg_stats["job_growth_score"] = (agg_stats["job_growth"] / max_growth) * 10
+    else:
+        agg_stats["job_growth_score"] = 0
+    
+    job_growth_scores = agg_stats[['project_id', 'job_growth_score']]
+    
+    return job_growth_scores
+
+# =============================================================================
+# 11. FREIGHT JOBS ACCESS
+# =============================================================================
+
+def analyze_freight_jobs(projects_gdf, lehd_gdf):
+    """Analyze access to freight jobs"""
+    
+    # Load datasets
+    projects = projects_gdf.copy()
+    lehd = lehd_gdf.copy()
+    
+    # Ensure same CRS
+    if projects.crs != lehd.crs:
+        lehd = lehd.to_crs(projects.crs)
+    
+    # Define buffer distances (in meters)
+    mile_to_meter = 1609.34
+    buffer_distances = {"PA": 10 * mile_to_meter, "MA": 7.5 * mile_to_meter, "MC": 5 * mile_to_meter}
+    
+    # Create buffers
+    projects["buffer_dist"] = projects["fc"].map(buffer_distances)
+    projects_buffer = projects.copy()
+    projects_buffer["geometry"] = projects_buffer.geometry.buffer(projects_buffer["buffer_dist"])
+    
+    # Compute centroids of LEHD points
+    lehd_centroids = lehd.copy()
+    lehd_centroids["geometry"] = lehd_centroids.geometry.centroid
+    
+    # Spatial join (points within buffers)
+    joined = gpd.sjoin(
+        lehd_centroids,
+        projects_buffer[["project_id", "geometry"]],
+        predicate="within"
+    )
+    
+    # Aggregate stats by project_id
+    agg_stats = (
+        joined.groupby("project_id", as_index=False)
+        .agg({
+            "freight_jobs": "sum"
+        })
+    )
+    
+    # Normalize freight jobs (0-10 scale)
+    max_freight = agg_stats["freight_jobs"].max()
+    if max_freight > 0:
+        agg_stats["freight_score"] = (agg_stats["freight_jobs"] / max_freight) * 10
+    else:
+        agg_stats["freight_score"] = 0
+    
+    freight_scores = agg_stats[['project_id', 'freight_score']]
+    
+    return freight_scores
+
+# =============================================================================
+# 12. ACTIVITY CENTERS PROXIMITY
+# =============================================================================
+
+def analyze_activity_centers(projects_gdf, actv_gdf):
+    """Analyze proximity to activity centers"""
+    
+    # Load datasets
+    projects = projects_gdf.copy()
+    actv = actv_gdf.copy()
+    
+    # Ensure same CRS
+    if projects.crs != actv.crs:
+        actv = actv.to_crs(projects.crs)
+    
+    # Define buffer distances (in meters)
+    mile_to_meter = 1609.34
+    buffer_distances = {"PA": 10 * mile_to_meter, "MA": 7.5 * mile_to_meter, "MC": 5 * mile_to_meter}
+    
+    # Create buffers
+    projects["buffer_dist"] = projects["fc"].map(buffer_distances)
+    projects_buffer = projects.copy()
+    projects_buffer["geometry"] = projects_buffer.geometry.buffer(projects_buffer["buffer_dist"])
+    
+    # Spatial join (points within buffers)
+    joined = gpd.sjoin(
+        actv,
+        projects_buffer[["project_id", "geometry"]],
+        predicate="within"
+    )
+    
+    # Count points by project_id
+    agg_counts = (
+        joined.groupby("project_id")
+        .size()
+        .reset_index(name="actv_count")
+    )
+    
+    # Normalize activity center count (0-10 scale)
+    max_count = agg_counts["actv_count"].max()
+    if max_count > 0:
+        agg_counts["activity_score"] = (agg_counts["actv_count"] / max_count) * 10
+    else:
+        agg_counts["activity_score"] = 0
+    
+    activity_scores = agg_counts[['project_id', 'activity_score']]
+    
+    return activity_scores
+
+# =============================================================================
+# MAIN ANALYSIS FUNCTION
+# =============================================================================
+
+def run_analysis(files_dict: Dict[str, str], output_dir: str):
+    """Main function to run all analyses and generate final ranking"""
+    
+    print("Starting highway projects analysis...")
+    
+    print("All required files found. Starting analysis...")
+
+    # Load all data into GeoDataFrames
+    try:
+        projects_gdf = gpd.read_file(files_dict['projects'])
+        crashes_gdf = gpd.read_file(files_dict['crashes'])
+        aadt_gdf = gpd.read_file(files_dict['aadt'])
+        popemp_gdf = gpd.read_file(files_dict['popemp'])
+        actv_gdf = gpd.read_file(files_dict['actv'])
+        con_gdf = gpd.read_file(files_dict['con']) # This now reads congestion.geojson
+        fhz_gdf = gpd.read_file(files_dict['fhz'])
+        frsk_gdf = gpd.read_file(files_dict['frsk'])
+        lehd_gdf = gpd.read_file(files_dict['lehd'])
+        nw_gdf = gpd.read_file(files_dict['nw'])
+        t6_gdf = gpd.read_file(files_dict['t6'])
+        wet_gdf = gpd.read_file(files_dict['wet'])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error loading geospatial data: {e}")
+
+    # Add project_id if not present
+    if "project_id" not in projects_gdf.columns:
+        projects_gdf["project_id"] = range(1, len(projects_gdf) + 1)
+    
+    # Run all analyses
+    print("1. Analyzing safety frequency...")
+    safety_freq = analyze_safety_frequency(projects_gdf, crashes_gdf)
+    
+    print("2. Analyzing safety rate...")
+    safety_rate = analyze_safety_rate(projects_gdf, crashes_gdf)
+    
+    print("3. Analyzing congestion demand...")
+    cong_demand = analyze_congestion_demand(projects_gdf, aadt_gdf)
+    
+    print("4. Analyzing congestion level of service...")
+    cong_los = analyze_congestion_los(projects_gdf, aadt_gdf)
+    
+    print("5. Analyzing equity and access to jobs...")
+    eq_acc_jobs = analyze_equity_access_jobs(projects_gdf, popemp_gdf)
+    
+    print("6. Analyzing equity and access to jobs (EJ)...")
+    eq_acc_jobs_ej = analyze_equity_access_jobs_ej(projects_gdf, popemp_gdf, t6_gdf)
+    
+    print("7. Analyzing access to non-work destinations...")
+    eq_acc_nw = analyze_access_non_work(projects_gdf, popemp_gdf, nw_gdf)
+    
+    print("8. Analyzing access to non-work destinations (EJ)...")
+    eq_acc_nw_ej = analyze_access_non_work_ej(projects_gdf, popemp_gdf, nw_gdf, t6_gdf)
+    
+    print("9. Analyzing sensitive features...")
+    env_scores = analyze_sensitive_features(projects_gdf, fhz_gdf, frsk_gdf, wet_gdf, con_gdf)
+    
+    print("10. Analyzing job growth...")
+    job_growth_scores = analyze_job_growth(projects_gdf, popemp_gdf)
+    
+    # Optional analyses
+    freight_scores = None
+    activity_scores = None
+    
+    if os.path.exists('lehd.geojson'):
+        print("11. Analyzing freight jobs access...")
+        freight_scores = analyze_freight_jobs(projects_gdf, lehd_gdf)
+    
+    if os.path.exists('actv.geojson'):
+        print("12. Analyzing activity centers proximity...")
+        activity_scores = analyze_activity_centers(projects_gdf, actv_gdf)
+    
+    # Combine all dataframes
+    dfs = [
+        safety_freq,
+        safety_rate,
+        cong_demand,
+        cong_los,
+        eq_acc_jobs,
+        eq_acc_jobs_ej,
+        eq_acc_nw,
+        eq_acc_nw_ej,
+        env_scores,
+        job_growth_scores
+    ]
+    
+    # Add optional analyses if they exist
+    if freight_scores is not None:
+        dfs.append(freight_scores)
+    
+    if activity_scores is not None:
+        dfs.append(activity_scores)
+    
+    # Merge all the regular dataframes on 'project_id'
+    merged_data_df = reduce(lambda left, right: pd.merge(left, right, on="project_id", how="outer"), dfs)
+    
+    # Extract the non-geometry data from the GeoDataFrame
+    gdf_data = projects_gdf
+    
+    # Merge the combined data with the GeoDataFrame's attribute data
+    final_attributes_df = pd.merge(merged_data_df, gdf_data, on="project_id", how="outer")
+    
+    # Join this final attribute table back to the original GeoDataFrame to get the geometry
+    final_gdf = projects_gdf[['project_id', 'geometry']].merge(final_attributes_df, on='project_id', how='right')
+    
+    # Handle multiple geometry columns - drop any extra geometry columns
+    geometry_columns = [col for col in final_gdf.columns if final_gdf[col].dtype == 'geometry']
+    if len(geometry_columns) > 1:
+        print(f"Found multiple geometry columns: {geometry_columns}")
+        # Keep only the main geometry column, drop others
+        for geom_col in geometry_columns[1:]:
+            final_gdf = final_gdf.drop(columns=[geom_col])
+        print(f"Keeping only '{geometry_columns[0]}' geometry column")
+    
+    # Fill NaN values with 0 for all score columns
+    score_columns = [
+        'safety_freq', 'safety_rate', 'cong_demand', 'cong_los',
+        'jobs_pc', 'jobs_pc_ej', 'access_nw_norm', 'access_nw_ej_norm',
+        'env_impact_score', 'job_growth_score'
+    ]
+    
+    if freight_scores is not None:
+        score_columns.append('freight_score')
+    
+    if activity_scores is not None:
+        score_columns.append('activity_score')
+    
+    for col in score_columns:
+        if col in final_gdf.columns:
+            final_gdf[col] = final_gdf[col].fillna(0)
+    
+    # Calculate the total benefit score (sum of all normalized scores)
+    final_gdf['total_score'] = final_gdf[score_columns].sum(axis=1)
+    
+    # Calculate the Benefit-Cost Ratio (BCR)
+    final_gdf['bcr'] = final_gdf['total_score'] / final_gdf['cost_mil']
+    
+    # Rank the projects based on the BCR (higher BCR is better)
+    final_gdf['rank'] = final_gdf['bcr'].rank(ascending=False, method='dense').astype(int)
+    
+    # Create comprehensive results summary
+    results_columns = ['project_id', 'type', 'county', 'cost_mil', 'tier'] + score_columns + ['total_score', 'bcr', 'rank']
+    
+    # Only include columns that exist in the dataframe
+    available_columns = [col for col in results_columns if col in final_gdf.columns]
+    
+    results_df = final_gdf[available_columns].sort_values('rank')
+    
+    print("\n" + "="*80)
+    print("FINAL PROJECT RANKINGS")
+    print("="*80)
+    print(results_df.to_string(index=False))
+    
+    # Print summary statistics
+    print("\n" + "="*80)
+    print("SUMMARY STATISTICS")
+    print("="*80)
+    print(f"Total projects analyzed: {len(results_df)}")
+    print(f"Total score range: {results_df['total_score'].min():.2f} - {results_df['total_score'].max():.2f}")
+    print(f"BCR range: {results_df['bcr'].min():.3f} - {results_df['bcr'].max():.3f}")
+    print(f"Average cost: ${results_df['cost_mil'].mean():.2f}M")
+    
+    # Save results
+    # Save the main results as a CSV file.
+    results_csv_path = os.path.join(output_dir, "stbg_results.csv")
+    results_df.to_csv(results_csv_path, index=False)
+    print(f"✓ Saved stbg_results.csv to {output_dir}")
+    results_df.to_csv(os.path.join(output_dir, "project_rankings.csv"), index=False)
+    print(f"✓ Saved project_rankings.csv to {output_dir}")
+
+    # Convert to serializable format for JSON response
+    results_list = results_df.to_dict(orient='records')
+    
+    # Clean up NaN/inf values for JSON serialization
+    for project in results_list:
+        for key, value in project.items():
+            if pd.isna(value) or value == float('inf') or value == float('-inf'):
+                project[key] = None # or 0, depending on desired representation
+
+    summary = {
+        "total_projects": len(results_list),
+        "total_cost": final_gdf['cost_mil'].sum()
+    }
+
+    return {"projects": results_list, "summary": summary}
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the STBG Project Prioritization API"}
-
-
-@app.options("/analyze")
-async def analyze_options():
-    return JSONResponse(content={"message": "OK"})
 
 @app.post("/analyze", response_model=AnalysisResults)
 async def analyze_projects(
     projects_file: UploadFile = File(...),
     crashes_file: UploadFile = File(...),
     aadt_file: UploadFile = File(...),
-    pop_emp_file: UploadFile = File(...),
-    ej_areas_file: UploadFile = File(...),
-    non_work_dest_file: UploadFile = File(...),
-    hopewell_frsk_file: UploadFile = File(...),
-    hopewell_fhz_file: UploadFile = File(...),
-    hopewell_wet_file: UploadFile = File(...),
-    hopewell_con_file: UploadFile = File(...),
-    actv_mpo_file: UploadFile = File(...),
+    popemp_file: UploadFile = File(...),
+    actv_file: UploadFile = File(...),
+    con_file: UploadFile = File(...),
+    fhz_file: UploadFile = File(...),
+    frsk_file: UploadFile = File(...),
+    lehd_file: UploadFile = File(...),
+    nw_file: UploadFile = File(...),
     t6_file: UploadFile = File(...),
+    wet_file: UploadFile = File(...),
 ):
+    # Define the output directory relative to this script's location.
+    # The script is in `public/stbg_elijah`, so we go up one level to get to `public`.
+    output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.makedirs(output_dir, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         files_dict = {}
         try:
-            # Map the incoming UploadFile objects to the keys the analyzer expects.
-            # This is more robust than parsing filenames.
-            all_files = {
-                "projects": projects_file,
-                "crashes": crashes_file,
-                "aadt": aadt_file,
-                "pop_emp": pop_emp_file,
-                "ej_areas": ej_areas_file,
-                "non_work_dest": non_work_dest_file,
-                "hopewell_frsk": hopewell_frsk_file,
-                "hopewell_fhz": hopewell_fhz_file,
-                "hopewell_wet": hopewell_wet_file,
-                "hopewell_con": hopewell_con_file,
-                "actv_mpo": actv_mpo_file,
-                "t6": t6_file,
+            # Map incoming files to the keys used in the analysis functions
+            all_files = locals()
+            file_uploads = {
+                "projects": projects_file, "crashes": crashes_file, "aadt": aadt_file,
+                "popemp": popemp_file, "actv": actv_file, "con": con_file,
+                "fhz": fhz_file, "frsk": frsk_file, "lehd": lehd_file,
+                "nw": nw_file, "t6": t6_file, "wet": wet_file
             }
 
-            for key, upload_file in all_files.items():
+            for key, upload_file in file_uploads.items():
                 file_path = os.path.join(temp_dir, upload_file.filename)
                 with open(file_path, "wb") as f:
-                    f.write(await upload_file.read())
+                    content = await upload_file.read()
+                    f.write(content)
                 files_dict[key] = file_path
 
-            analyzer = STBGAnalyzer()
-            analyzer.load_geospatial_data(files_dict)
+            # Run the main analysis function with the paths to the temporary files
+            results = run_analysis(files_dict, output_dir)
             
-            results = analyzer.calculate_final_scores()
-            
-            if "error" in results.get("summary", {}):
-                raise HTTPException(status_code=500, detail=results["summary"]["error"])
-                
-            response = JSONResponse(content=results)
-            return response
+            if not results or "projects" not in results:
+                 raise HTTPException(status_code=500, detail="Analysis failed to produce results.")
+
+            return results
 
         except HTTPException as he:
             raise he
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# =============================================================================
+# EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
