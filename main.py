@@ -787,7 +787,13 @@ def analyze_freight_jobs(projects_gdf, lehd_gdf):
         })
     )
     
-    # Normalize freight jobs (0-10 scale)
+    # Normalize freight jobs (0-10 scale)fastapi
+    uvicorn
+    gunicorn
+    geopandas
+    pandas
+    shapely
+    
     max_freight = agg_stats["freight_jobs"].max()
     if max_freight > 0:
         agg_stats["freight_score"] = (agg_stats["freight_jobs"] / max_freight) * 10
