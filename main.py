@@ -14,12 +14,28 @@ import os
 import tempfile
 from typing import List, Dict, Any
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
 warnings.filterwarnings('ignore')
 
 app = FastAPI(title="STBG Project Prioritization API", version="1.0.0")
+
+origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://stbg-projects-highway.netlify.app/",
+    "https://stbg-projects-highway.netlify.app",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class AnalysisResults(BaseModel):
     projects: List[Dict[str, Any]]
