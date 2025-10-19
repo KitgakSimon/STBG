@@ -918,15 +918,15 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
     print("10. Analyzing job growth...")
     job_growth_scores = analyze_job_growth(projects_gdf, popemp_gdf)
     
-    # Optional analyses
+    # Optional analyses based on file presence
     freight_scores = None
     activity_scores = None
     
-    if os.path.exists('lehd.geojson'):
+    if 'lehd' in files_dict:
         print("11. Analyzing freight jobs access...")
         freight_scores = analyze_freight_jobs(projects_gdf, lehd_gdf)
     
-    if os.path.exists('actv.geojson'):
+    if 'actv' in files_dict:
         print("12. Analyzing activity centers proximity...")
         activity_scores = analyze_activity_centers(projects_gdf, actv_gdf)
     
@@ -1054,7 +1054,7 @@ async def analyze_projects(
     crashes_file: UploadFile = File(...),
     aadt_file: UploadFile = File(...),
     popemp_file: UploadFile = File(...),
-    actv_file: UploadFile = File(...),
+    actv_file: UploadFile = File(None),
     con_file: UploadFile = File(...),
     fhz_file: UploadFile = File(...),
     frsk_file: UploadFile = File(...),
