@@ -1058,10 +1058,10 @@ async def analyze_projects(
     con_file: UploadFile = File(...),
     fhz_file: UploadFile = File(...),
     frsk_file: UploadFile = File(...),
-    lehd_file: UploadFile = File(...),
+    lehd_file: UploadFile = File(None),
     nw_file: UploadFile = File(...),
     t6_file: UploadFile = File(...),
-    wet_file: UploadFile = File(...),
+    wet_file: UploadFile = File(...)
 ):
     # Define the output directory relative to this script's location.
     # The script is in `public/stbg_elijah`, so we go up one level to get to `public`.
@@ -1081,6 +1081,8 @@ async def analyze_projects(
             }
 
             for key, upload_file in file_uploads.items():
+                if not upload_file:
+                    continue
                 file_path = os.path.join(temp_dir, upload_file.filename)
                 with open(file_path, "wb") as f:
                     content = await upload_file.read()
