@@ -12,11 +12,13 @@ from functools import reduce
 import warnings
 import os
 import tempfile
-from typing import List, Dict, Any
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import uuid
+import shutil
 
 warnings.filterwarnings('ignore')
 
@@ -38,9 +40,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# In-memory storage for task status and results.
+# For production, consider using a more persistent store like Redis or a database.
+analysis_tasks = {}
+
 class AnalysisResults(BaseModel):
     projects: List[Dict[str, Any]]
     summary: Dict[str, Any]
+
+class TaskStatus(BaseModel):
+    task_id: str
+    status: str
+    result: Optional[AnalysisResults] = None
+    detail: Optional[str] = None
+
+
 
 # =============================================================================
 # 1. SAFETY - CRASH FREQUENCY
@@ -859,7 +873,7 @@ def analyze_activity_centers(projects_gdf, actv_gdf):
 # MAIN ANALYSIS FUNCTION
 # =============================================================================
 
-def run_analysis(files_dict: Dict[str, str], output_dir: str):
+def run_analysis(task_id: str, files_dict: Dict[str, str], output_dir: str):
     """Main function to run all analyses and generate final ranking"""
     
     print("Starting highway projects analysis...")
@@ -868,6 +882,7 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
 
     # Load all data into GeoDataFrames
     try:
+        analysis_tasks[task_id] = {"status": "processing", "detail": "Loading data..."}
         projects_gdf = gpd.read_file(files_dict['projects'])
         crashes_gdf = gpd.read_file(files_dict['crashes'])
         aadt_gdf = gpd.read_file(files_dict['aadt'])
@@ -881,7 +896,9 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
         t6_gdf = gpd.read_file(files_dict['t6'])
         wet_gdf = gpd.read_file(files_dict['wet'])
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error loading geospatial data: {e}")
+        error_detail = f"Error loading geospatial data: {e}"
+        analysis_tasks[task_id] = {"status": "failed", "detail": error_detail}
+        raise Exception(error_detail)
 
     # Add project_id if not present
     if "project_id" not in projects_gdf.columns:
@@ -889,33 +906,43 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
     
     # Run all analyses
     print("1. Analyzing safety frequency...")
+    analysis_tasks[task_id]["detail"] = "Analyzing safety frequency..."
     safety_freq = analyze_safety_frequency(projects_gdf, crashes_gdf)
     
     print("2. Analyzing safety rate...")
+    analysis_tasks[task_id]["detail"] = "Analyzing safety rate..."
     safety_rate = analyze_safety_rate(projects_gdf, crashes_gdf)
     
     print("3. Analyzing congestion demand...")
+    analysis_tasks[task_id]["detail"] = "Analyzing congestion demand..."
     cong_demand = analyze_congestion_demand(projects_gdf, aadt_gdf)
     
     print("4. Analyzing congestion level of service...")
+    analysis_tasks[task_id]["detail"] = "Analyzing congestion level of service..."
     cong_los = analyze_congestion_los(projects_gdf, aadt_gdf)
     
     print("5. Analyzing equity and access to jobs...")
+    analysis_tasks[task_id]["detail"] = "Analyzing equity and access to jobs..."
     eq_acc_jobs = analyze_equity_access_jobs(projects_gdf, popemp_gdf)
     
     print("6. Analyzing equity and access to jobs (EJ)...")
+    analysis_tasks[task_id]["detail"] = "Analyzing equity and access to jobs (EJ)..."
     eq_acc_jobs_ej = analyze_equity_access_jobs_ej(projects_gdf, popemp_gdf, t6_gdf)
     
     print("7. Analyzing access to non-work destinations...")
+    analysis_tasks[task_id]["detail"] = "Analyzing access to non-work destinations..."
     eq_acc_nw = analyze_access_non_work(projects_gdf, popemp_gdf, nw_gdf)
     
     print("8. Analyzing access to non-work destinations (EJ)...")
+    analysis_tasks[task_id]["detail"] = "Analyzing access to non-work destinations (EJ)..."
     eq_acc_nw_ej = analyze_access_non_work_ej(projects_gdf, popemp_gdf, nw_gdf, t6_gdf)
     
     print("9. Analyzing sensitive features...")
+    analysis_tasks[task_id]["detail"] = "Analyzing sensitive features..."
     env_scores = analyze_sensitive_features(projects_gdf, fhz_gdf, frsk_gdf, wet_gdf, con_gdf)
     
     print("10. Analyzing job growth...")
+    analysis_tasks[task_id]["detail"] = "Analyzing job growth..."
     job_growth_scores = analyze_job_growth(projects_gdf, popemp_gdf)
     
     # Optional analyses based on file presence
@@ -924,10 +951,12 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
     
     if 'lehd' in files_dict:
         print("11. Analyzing freight jobs access...")
+        analysis_tasks[task_id]["detail"] = "Analyzing freight jobs access..."
         freight_scores = analyze_freight_jobs(projects_gdf, lehd_gdf)
     
     if 'actv' in files_dict:
         print("12. Analyzing activity centers proximity...")
+        analysis_tasks[task_id]["detail"] = "Analyzing activity centers proximity..."
         activity_scores = analyze_activity_centers(projects_gdf, actv_gdf)
     
     # Combine all dataframes
@@ -951,6 +980,7 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
     if activity_scores is not None:
         dfs.append(activity_scores)
     
+    analysis_tasks[task_id]["detail"] = "Merging all analysis results..."
     # Merge all the regular dataframes on 'project_id'
     merged_data_df = reduce(lambda left, right: pd.merge(left, right, on="project_id", how="outer"), dfs)
     
@@ -1042,14 +1072,30 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
         "total_cost": final_gdf['cost_mil'].sum()
     }
 
-    return {"projects": results_list, "summary": summary}
+    final_results = {"projects": results_list, "summary": summary}
+    analysis_tasks[task_id] = {"status": "completed", "result": final_results}
+    print(f"Analysis for task {task_id} completed successfully.")
+
+def analysis_wrapper(task_id: str, files_dict: Dict[str, str], output_dir: str, temp_dir: str):
+    """Wrapper to run analysis and handle cleanup."""
+    try:
+        run_analysis(task_id, files_dict, output_dir)
+    except Exception as e:
+        error_detail = f"Analysis failed: {str(e)}"
+        analysis_tasks[task_id] = {"status": "failed", "detail": error_detail}
+        print(error_detail)
+    finally:
+        # Clean up the temporary directory for this task
+        shutil.rmtree(temp_dir)
+        print(f"Cleaned up temporary directory: {temp_dir}")
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the STBG Project Prioritization API"}
 
-@app.post("/analyze", response_model=AnalysisResults)
+@app.post("/analyze", status_code=202)
 async def analyze_projects(
+    background_tasks: BackgroundTasks,
     projects_file: UploadFile = File(...),
     crashes_file: UploadFile = File(...),
     aadt_file: UploadFile = File(...),
@@ -1063,44 +1109,50 @@ async def analyze_projects(
     t6_file: UploadFile = File(...),
     wet_file: UploadFile = File(...)
 ):
-    # Define the output directory relative to this script's location.
-    # The script is in `public/stbg_elijah`, so we go up one level to get to `public`.
+    task_id = str(uuid.uuid4())
     output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.makedirs(output_dir, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        files_dict = {}
-        try:
-            # Map incoming files to the keys used in the analysis functions
-            all_files = locals()
-            file_uploads = {
-                "projects": projects_file, "crashes": crashes_file, "aadt": aadt_file,
-                "popemp": popemp_file, "actv": actv_file, "con": con_file,
-                "fhz": fhz_file, "frsk": frsk_file, "lehd": lehd_file,
-                "nw": nw_file, "t6": t6_file, "wet": wet_file
-            }
+    # Create a persistent temporary directory for this task
+    task_temp_dir = tempfile.mkdtemp()
+    files_dict = {}
 
-            for key, upload_file in file_uploads.items():
-                if not upload_file:
-                    continue
-                file_path = os.path.join(temp_dir, upload_file.filename)
-                with open(file_path, "wb") as f:
-                    content = await upload_file.read()
-                    f.write(content)
-                files_dict[key] = file_path
+    try:
+        file_uploads = {
+            "projects": projects_file, "crashes": crashes_file, "aadt": aadt_file,
+            "popemp": popemp_file, "actv": actv_file, "con": con_file,
+            "fhz": fhz_file, "frsk": frsk_file, "lehd": lehd_file,
+            "nw": nw_file, "t6": t6_file, "wet": wet_file
+        }
 
-            # Run the main analysis function with the paths to the temporary files
-            results = run_analysis(files_dict, output_dir)
-            
-            if not results or "projects" not in results:
-                 raise HTTPException(status_code=500, detail="Analysis failed to produce results.")
+        for key, upload_file in file_uploads.items():
+            if not upload_file:
+                continue
+            file_path = os.path.join(task_temp_dir, upload_file.filename)
+            with open(file_path, "wb") as f:
+                content = await upload_file.read()
+                f.write(content)
+            files_dict[key] = file_path
+        
+        # Set initial status
+        analysis_tasks[task_id] = {"status": "pending", "detail": "Task received."}
 
-            return results
+        # Add the analysis to background tasks
+        background_tasks.add_task(analysis_wrapper, task_id, files_dict, output_dir, task_temp_dir)
 
-        except HTTPException as he:
-            raise he
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+        return {"task_id": task_id, "status": "pending", "detail": "Analysis has started."}
+
+    except Exception as e:
+        # Clean up if file saving fails
+        shutil.rmtree(task_temp_dir)
+        raise HTTPException(status_code=500, detail=f"Failed to start analysis task: {str(e)}")
+
+@app.get("/status/{task_id}", response_model=TaskStatus)
+def get_status(task_id: str):
+    task = analysis_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return TaskStatus(task_id=task_id, **task)
 
 # =============================================================================
 # EXECUTION
