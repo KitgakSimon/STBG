@@ -789,13 +789,7 @@ def analyze_freight_jobs(projects_gdf, lehd_gdf):
         })
     )
     
-    # Normalize freight jobs (0-10 scale)fastapi
-    uvicorn
-    gunicorn
-    geopandas
-    pandas
-    shapely
-    
+    # Normalize freight jobs (0-10 scale)
     max_freight = agg_stats["freight_jobs"].max()
     if max_freight > 0:
         agg_stats["freight_score"] = (agg_stats["freight_jobs"] / max_freight) * 10
@@ -918,17 +912,11 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
     print("10. Analyzing job growth...")
     job_growth_scores = analyze_job_growth(projects_gdf, popemp_gdf)
     
-    # Optional analyses
-    freight_scores = None
-    activity_scores = None
+    print("11. Analyzing freight jobs access...")
+    freight_scores = analyze_freight_jobs(projects_gdf, lehd_gdf)
     
-    if os.path.exists('lehd.geojson'):
-        print("11. Analyzing freight jobs access...")
-        freight_scores = analyze_freight_jobs(projects_gdf, lehd_gdf)
-    
-    if os.path.exists('actv.geojson'):
-        print("12. Analyzing activity centers proximity...")
-        activity_scores = analyze_activity_centers(projects_gdf, actv_gdf)
+    print("12. Analyzing activity centers proximity...")
+    activity_scores = analyze_activity_centers(projects_gdf, actv_gdf)
     
     # Combine all dataframes
     dfs = [
@@ -941,15 +929,10 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
         eq_acc_nw,
         eq_acc_nw_ej,
         env_scores,
-        job_growth_scores
+        job_growth_scores,
+        freight_scores,
+        activity_scores
     ]
-    
-    # Add optional analyses if they exist
-    if freight_scores is not None:
-        dfs.append(freight_scores)
-    
-    if activity_scores is not None:
-        dfs.append(activity_scores)
     
     # Merge all the regular dataframes on 'project_id'
     merged_data_df = reduce(lambda left, right: pd.merge(left, right, on="project_id", how="outer"), dfs)
@@ -976,14 +959,8 @@ def run_analysis(files_dict: Dict[str, str], output_dir: str):
     score_columns = [
         'safety_freq', 'safety_rate', 'cong_demand', 'cong_los',
         'jobs_pc', 'jobs_pc_ej', 'access_nw_norm', 'access_nw_ej_norm',
-        'env_impact_score', 'job_growth_score'
+        'env_impact_score', 'job_growth_score', 'freight_score', 'activity_score'
     ]
-    
-    if freight_scores is not None:
-        score_columns.append('freight_score')
-    
-    if activity_scores is not None:
-        score_columns.append('activity_score')
     
     for col in score_columns:
         if col in final_gdf.columns:
