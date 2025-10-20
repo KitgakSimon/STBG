@@ -25,7 +25,7 @@ app = FastAPI(title="STBG Project Prioritization API", version="1.0.0")
 origins = [
     "http://localhost:5173",
     "http://localhost:5174",
-    "https://stbg-projects-highway.netlify.app",
+    "https://stbg-projects-highway-py.netlify.app",
     "https://stbg.onrender.com", # The backend origin
     "https://stbg-projects-highway.netlify.app/", # Trailing slash for flexibility
 ]
@@ -1082,4 +1082,4 @@ async def analyze_projects(
 # =============================================================================
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
