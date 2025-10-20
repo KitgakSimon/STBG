@@ -27,7 +27,7 @@ origins = [
     "http://localhost:5174",
     "https://stbg-projects-highway-py.netlify.app",
     "https://stbg.onrender.com", # The backend origin
-    "https://stbg-projects-highway.netlify.app/", # Trailing slash for flexibility
+    "https://stbg-projects-highway.netlify.app",
 ]
 
 app.add_middleware(
