@@ -29,6 +29,7 @@ origins = [
     "https://stbg.onrender.com", # The backend origin
     "https://stbg-projects-highway-py-production.netlify.app",
     "https://stbg-projects-highway-test.netlify.app",
+    "https://stbg-projects-highway-py-test.netlify.app",
 ]
 
 app.add_middleware(
